@@ -5,6 +5,7 @@ const CHROMIUM_PATH = '/usr/bin/chromium';
 const WS_PORT = 3001;
 const VIEWPORT = { width: 1280, height: 720 };
 const START_URL = 'https://google.com';
+const NAV_TIMEOUT = 20000; // 20 s — generous enough for slow sites
 
 const BROWSER_ARGS = [
   '--no-sandbox',
@@ -28,51 +29,95 @@ console.log(`[container] WebSocket server listening on ws://0.0.0.0:${WS_PORT}`)
 wss.on('connection', async (ws) => {
   console.log('[container] Client connected — launching browser session...');
 
-  let browser = null;
+  let browser   = null;
   let cdpClient = null;
 
-  try {
-    browser = await puppeteer.launch({
-      executablePath: CHROMIUM_PATH,
-      headless: true,
-      args: BROWSER_ARGS,
+  // ── Screencast lifecycle ──────────────────────────────────────────────────
+  // We keep a single named handler so we can remove it before restarting.
+  // Without this, every navigation accumulated a NEW 'Page.screencastFrame'
+  // listener while the old one was still attached, causing duplicate ACKs
+  // that silently killed the CDP stream (0 fps after navigate).
+  let frameHandler = null;
+
+  async function stopScreencast() {
+    if (frameHandler) {
+      cdpClient.removeListener('Page.screencastFrame', frameHandler);
+      frameHandler = null;
+    }
+    try { await cdpClient.send('Page.stopScreencast'); } catch (_) {}
+  }
+
+  async function startScreencast() {
+    // Always tear down any existing screencast first
+    await stopScreencast();
+
+    await cdpClient.send('Page.startScreencast', {
+      format:        'jpeg',
+      quality:       75,
+      maxWidth:      VIEWPORT.width,
+      maxHeight:     VIEWPORT.height,
+      everyNthFrame: 1,
     });
 
-    const page = await browser.newPage();
-    await page.setViewport(VIEWPORT);
-
-    console.log(`[container] Navigating to ${START_URL}...`);
-    await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
-    console.log('[container] Page ready. Starting screencast...');
-
-    cdpClient = await page.createCDPSession();
-
-    // Extracted so we can restart it after every navigation
-    async function startScreencast() {
-      await cdpClient.send('Page.startScreencast', {
-        format: 'jpeg',
-        quality: 75,
-        maxWidth: VIEWPORT.width,
-        maxHeight: VIEWPORT.height,
-        everyNthFrame: 1,
-      });
-    }
-
-    await startScreencast();
-
-    cdpClient.on('Page.screencastFrame', async ({ data, sessionId }) => {
+    frameHandler = async ({ data, sessionId }) => {
       if (ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify({ type: 'frame', data }));
       }
       try {
         await cdpClient.send('Page.screencastFrameAck', { sessionId });
       } catch (_) {
-        // session may have closed so ignore
+        // CDP session may have closed — ignore
       }
+    };
+
+    cdpClient.on('Page.screencastFrame', frameHandler);
+    console.log('[container] Screencast started.');
+  }
+
+  // ── Safe navigate helper ──────────────────────────────────────────────────
+  // Stops screencast, navigates with a timeout, restarts screencast, and
+  // sends a url_changed event. Falls back gracefully on timeout/error.
+  async function safeNavigate(page, url) {
+    console.log(`[container] Navigating to: ${url}`);
+    await stopScreencast();
+
+    try {
+      await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout:   NAV_TIMEOUT,
+      });
+    } catch (err) {
+      // TimeoutError is common on heavy JS pages (YouTube, etc.).
+      // The page still has partial content — restart the screencast anyway.
+      console.warn(`[container] Navigation warning (${url}): ${err.message}`);
+    }
+
+    await startScreencast();
+
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: 'url_changed', url: page.url() }));
+    }
+  }
+
+  // ── Main session ──────────────────────────────────────────────────────────
+  try {
+    browser = await puppeteer.launch({
+      executablePath: CHROMIUM_PATH,
+      headless:       true,
+      args:           BROWSER_ARGS,
     });
 
+    const page = await browser.newPage();
+    await page.setViewport(VIEWPORT);
+    page.setDefaultNavigationTimeout(NAV_TIMEOUT);
 
-    //    I used normalized coordinates (0.0 to 1.0) so the frontend doesn't need to know the container's viewport resolution. I multiplied here.
+    cdpClient = await page.createCDPSession();
+
+    console.log(`[container] Navigating to ${START_URL}...`);
+    await safeNavigate(page, START_URL);
+    console.log('[container] Initial page ready, screencast running.');
+
+    // ── Command dispatcher ──────────────────────────────────────────────────
     ws.on('message', async (raw) => {
       let msg;
       try {
@@ -86,21 +131,16 @@ wss.on('connection', async (ws) => {
         switch (msg.type) {
 
           case 'click': {
-            //  normalized coords to pixel coords
             const px = Math.round(msg.x * VIEWPORT.width);
             const py = Math.round(msg.y * VIEWPORT.height);
             console.log(`[container] Click at pixel (${px}, ${py})`);
-
-
             await cdpClient.send('Input.dispatchMouseEvent', {
               type: 'mousePressed', x: px, y: py,
-              button: 'left', clickCount: 1,
-              modifiers: 0,
+              button: 'left', clickCount: 1, modifiers: 0,
             });
             await cdpClient.send('Input.dispatchMouseEvent', {
               type: 'mouseReleased', x: px, y: py,
-              button: 'left', clickCount: 1,
-              modifiers: 0,
+              button: 'left', clickCount: 1, modifiers: 0,
             });
             break;
           }
@@ -109,8 +149,7 @@ wss.on('connection', async (ws) => {
             const px = Math.round(msg.x * VIEWPORT.width);
             const py = Math.round(msg.y * VIEWPORT.height);
             await cdpClient.send('Input.dispatchMouseEvent', {
-              type: 'mouseMoved', x: px, y: py,
-              button: 'none',
+              type: 'mouseMoved', x: px, y: py, button: 'none',
             });
             break;
           }
@@ -126,7 +165,6 @@ wss.on('connection', async (ws) => {
           }
 
           case 'keydown': {
-  
             await cdpClient.send('Input.dispatchKeyEvent', {
               type: 'keyDown', key: msg.key,
             });
@@ -142,24 +180,17 @@ wss.on('connection', async (ws) => {
           }
 
           case 'navigate': {
-            // Auto-prefix https:// so bare domains like 'google.com' work
             let targetUrl = msg.url.trim();
             if (!/^https?:\/\//i.test(targetUrl)) {
               targetUrl = 'https://' + targetUrl;
             }
-            console.log(`[container] Navigating to: ${targetUrl}`);
-            try { await cdpClient.send('Page.stopScreencast'); } catch (_) {}
-            await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
-            await startScreencast();
-            if (ws.readyState === ws.OPEN) {
-              ws.send(JSON.stringify({ type: 'url_changed', url: page.url() }));
-            }
+            await safeNavigate(page, targetUrl);
             break;
           }
 
           case 'back': {
-            try { await cdpClient.send('Page.stopScreencast'); } catch (_) {}
-            await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
+            await stopScreencast();
+            await page.goBack({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => {});
             await startScreencast();
             if (ws.readyState === ws.OPEN) {
               ws.send(JSON.stringify({ type: 'url_changed', url: page.url() }));
@@ -168,8 +199,8 @@ wss.on('connection', async (ws) => {
           }
 
           case 'forward': {
-            try { await cdpClient.send('Page.stopScreencast'); } catch (_) {}
-            await page.goForward({ waitUntil: 'domcontentloaded' }).catch(() => {});
+            await stopScreencast();
+            await page.goForward({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => {});
             await startScreencast();
             if (ws.readyState === ws.OPEN) {
               ws.send(JSON.stringify({ type: 'url_changed', url: page.url() }));
@@ -178,8 +209,8 @@ wss.on('connection', async (ws) => {
           }
 
           case 'reload': {
-            try { await cdpClient.send('Page.stopScreencast'); } catch (_) {}
-            await page.reload({ waitUntil: 'domcontentloaded' });
+            await stopScreencast();
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => {});
             await startScreencast();
             if (ws.readyState === ws.OPEN) {
               ws.send(JSON.stringify({ type: 'url_changed', url: page.url() }));
@@ -203,12 +234,8 @@ wss.on('connection', async (ws) => {
 
   ws.on('close', async () => {
     console.log('[container] Client disconnected. Cleaning up...');
-    try {
-      if (cdpClient) await cdpClient.send('Page.stopScreencast');
-    } catch (_) {}
-    try {
-      if (browser) await browser.close();
-    } catch (_) {}
+    try { await stopScreencast(); } catch (_) {}
+    try { if (browser) await browser.close(); } catch (_) {}
     console.log('[container] Browser closed. Ready for next connection.');
   });
 
