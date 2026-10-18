@@ -1,7 +1,7 @@
 {
-  "name": "browse-backend",
+  "name": "safebrowser-backend",
   "version": "3.0.0",
-  "description": "Orchestrator backend: spins up Docker containers and relays WebSocket streams",
+  "description": "SafeBrowser orchestrator backend: spins up Docker containers and relays WebSocket streams",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

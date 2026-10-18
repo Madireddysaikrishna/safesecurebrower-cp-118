@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Browse — Remote Browser Control',
+  title: 'SafeBrowser — Remote Browser Control',
   description: 'Control a headless Chromium instance remotely from your browser.',
 };
 

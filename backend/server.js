@@ -13,13 +13,14 @@ const CONTAINER_IMAGE = 'browse-container:phase2';
 const MAX_SESSIONS    = 5;
 const TTL_MS          = 2 * 60 * 1000; // 2 minutes
 
-const CONTAINER_MEMORY_BYTES = 256 * 1024 * 1024; // 256 MB RAM 
-const CONTAINER_NANO_CPUS    = 0.5 * 1e9;         // 0.5 CPU cores 
+const CONTAINER_MEMORY_BYTES = 256 * 1024 * 1024; // 256 MB RAM
+const CONTAINER_NANO_CPUS    = 0.5 * 1e9;         // 0.5 CPU cores
+const CONTAINER_PIDS_LIMIT   = 200;                // prevent fork-bomb inside container
 
 const app    = express();
 app.use(cors({ origin: '*' }));
 const server = http.createServer(app);
-const docker = new Docker({ socketPath: '/var/run/docker.sock' });
+const docker = new Docker({ socketPath: '//./pipe/docker_engine' });
 const wss    = new WebSocketServer({ server });
 
 async function waitForContainerPort(port, maxRetries = 30, intervalMs = 500) {
@@ -127,14 +128,30 @@ async function startNewSession(frontendWs) {
     container = await docker.createContainer({
       Image: CONTAINER_IMAGE,
       HostConfig: {
-        AutoRemove: true,
-        NetworkMode: 'bridge',
-        PortBindings: {
-          '3001/tcp': [{ HostPort: String(port) }],
-        },
-        Memory:     CONTAINER_MEMORY_BYTES,
-        MemorySwap: CONTAINER_MEMORY_BYTES, // Equal to Memory = swap fully disabled
-        NanoCpus:   CONTAINER_NANO_CPUS,
+        AutoRemove:    true,
+        NetworkMode:   'bridge',
+        PortBindings:  { '3001/tcp': [{ HostPort: String(port) }] },
+
+        // ── Memory & CPU (existing) ────────────────────────────────────────
+        Memory:        CONTAINER_MEMORY_BYTES,
+        MemorySwap:    CONTAINER_MEMORY_BYTES, // disables swap entirely
+        NanoCpus:      CONTAINER_NANO_CPUS,
+
+        // ── Isolation hardening ───────────────────────────────────────────
+        // Drop every Linux capability. Chromium with --no-sandbox needs none.
+        CapDrop:       ['ALL'],
+
+        // Block privilege escalation via setuid/setgid binaries.
+        SecurityOpt:   ['no-new-privileges:true'],
+
+        // Limit total PIDs to prevent fork-bomb style DoS from inside.
+        PidsLimit:     CONTAINER_PIDS_LIMIT,
+
+        // NOTE: ReadonlyRootfs is intentionally omitted.
+        // Debian's Chromium package spawns `chrome_crashpad_handler` which
+        // requires a writable home directory and cannot be disabled via flags.
+        // Primary isolation is via: non-root user, CapDrop ALL,
+        // no-new-privileges, PidsLimit, Memory, and CPU limits.
       },
     });
 
@@ -144,11 +161,25 @@ async function startNewSession(frontendWs) {
 
     await waitForContainerPort(port);
 
-    containerWs = new WebSocket(`ws://localhost:${port}`);
-    await new Promise((resolve, reject) => {
-      containerWs.on('open', resolve);
-      containerWs.on('error', (err) => reject(new Error(`Container WS error: ${err.message}`)));
-    });
+    // Retry WS connect — the TCP port can open before ws is ready to upgrade
+    containerWs = await (async () => {
+      const maxTries = 10;
+      for (let i = 1; i <= maxTries; i++) {
+        try {
+          const ws = new WebSocket(`ws://localhost:${port}`);
+          await new Promise((resolve, reject) => {
+            ws.on('open',  resolve);
+            ws.on('error', reject);
+          });
+          console.log(`[backend] Container WS connected on attempt ${i}.`);
+          return ws;
+        } catch (err) {
+          if (i === maxTries) throw new Error(`Container WS failed after ${maxTries} attempts: ${err.message}`);
+          console.log(`[backend] WS attempt ${i}/${maxTries} failed, retrying in 500ms...`);
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+    })();
 
     sessionId = registry.createSession(container, containerWs, port, frontendWs);
     console.log(`[backend] Relay ready. Session: ${sessionId.slice(0, 8)}...`);
@@ -237,7 +268,7 @@ async function cleanup(sessionId, container, containerWs, port) {
 }
 
 server.listen(BACKEND_PORT, () => {
-  console.log(`\n[backend] Vessel backend ready`);
+  console.log(`\n[backend] SafeBrowser backend ready`);
   console.log(`  HTTP   → http://localhost:${BACKEND_PORT}`);
   console.log(`  WS     → ws://localhost:${BACKEND_PORT}`);
   console.log(`  Status → http://localhost:${BACKEND_PORT}/api/status`);

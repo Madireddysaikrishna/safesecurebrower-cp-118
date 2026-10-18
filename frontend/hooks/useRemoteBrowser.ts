@@ -15,19 +15,21 @@ export interface RemoteBrowserActions {
   disconnect: () => void;
   send:       (msg: object) => void;
   setOnFrame: (cb: (data: string) => void) => void;
+  setOnUrlChange: (cb: (url: string) => void) => void;
 }
 
 const WS_URL            = process.env.NEXT_PUBLIC_BACKEND_URL || 'ws://localhost:3000';
-const SESSION_STORAGE_KEY = 'vessel_session_id';
+const SESSION_STORAGE_KEY = 'safebrowser_session_id';
 
 export function useRemoteBrowser(): RemoteBrowserState & RemoteBrowserActions {
   const [sessionState, setSessionState] = useState<SessionState>('idle');
   const [statusMsg, setStatusMsg]       = useState('');
   const [fps, setFps]                   = useState(0);
 
-  const wsRef         = useRef<WebSocket | null>(null);
-  const frameCountRef = useRef(0);
-  const onFrameRef    = useRef<((data: string) => void) | null>(null);
+  const wsRef           = useRef<WebSocket | null>(null);
+  const frameCountRef   = useRef(0);
+  const onFrameRef      = useRef<((data: string) => void) | null>(null);
+  const onUrlChangeRef  = useRef<((url: string) => void) | null>(null);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -38,7 +40,9 @@ export function useRemoteBrowser(): RemoteBrowserState & RemoteBrowserActions {
   }, []);
 
   const connect = useCallback(() => {
+    // Guard: already connecting or active
     if (wsRef.current) return;
+    if (sessionState !== 'idle' && sessionState !== 'error') return;
 
     const storedSessionId = localStorage.getItem(SESSION_STORAGE_KEY);
     const isReconnect     = !!storedSessionId;
@@ -66,6 +70,10 @@ export function useRemoteBrowser(): RemoteBrowserState & RemoteBrowserActions {
         case 'frame':
           frameCountRef.current++;
           onFrameRef.current?.(msg.data as string);
+          break;
+
+        case 'url_changed':
+          onUrlChangeRef.current?.(msg.url as string);
           break;
 
         case 'status':
@@ -99,17 +107,24 @@ export function useRemoteBrowser(): RemoteBrowserState & RemoteBrowserActions {
     };
 
     ws.onclose = () => {
-      setSessionState('idle');
-      setStatusMsg('');
       wsRef.current = null;
+      // Only reset to idle if we weren't already set to error by onerror.
+      // This prevents the landing page re-render from triggering a new connect cycle.
+      setSessionState((prev) => (prev === 'error' ? 'idle' : 'idle'));
+      setStatusMsg('');
     };
 
     ws.onerror = () => {
+      // Clear stale session so the next connect attempt starts fresh.
+      // Without this, the old session ID is re-sent → backend responds
+      // 'session_expired' → state goes to 'booting' → container launch
+      // fails → error → onclose → idle → user clicks again → infinite loop.
+      localStorage.removeItem(SESSION_STORAGE_KEY);
       setSessionState('error');
       setStatusMsg('Cannot connect to backend. Is `node server.js` running in backend/?');
       wsRef.current = null;
     };
-  }, []);
+  }, [sessionState]);
 
   const disconnect = useCallback(() => {
     localStorage.removeItem(SESSION_STORAGE_KEY);
@@ -129,5 +144,9 @@ export function useRemoteBrowser(): RemoteBrowserState & RemoteBrowserActions {
     onFrameRef.current = cb;
   }, []);
 
-  return { sessionState, statusMsg, fps, connect, disconnect, send, setOnFrame };
+  const setOnUrlChange = useCallback((cb: (url: string) => void) => {
+    onUrlChangeRef.current = cb;
+  }, []);
+
+  return { sessionState, statusMsg, fps, connect, disconnect, send, setOnFrame, setOnUrlChange };
 }

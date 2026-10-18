@@ -71,10 +71,11 @@ interface StreamViewProps {
   fps:          number;
   send:         (msg: object) => void;
   setOnFrame:   (cb: (data: string) => void) => void;
+  setOnUrlChange: (cb: (url: string) => void) => void;
   onStop:       () => void;
 }
 
-function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, onStop }: StreamViewProps) {
+function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, setOnUrlChange, onStop }: StreamViewProps) {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [url, setUrl] = useState('https://google.com');
 
@@ -85,6 +86,13 @@ function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, onStop }: 
       }
     });
   }, [setOnFrame]);
+
+  // Keep the URL bar in sync when the remote browser navigates (clicked links, redirects)
+  useEffect(() => {
+    setOnUrlChange((newUrl: string) => {
+      setUrl(newUrl);
+    });
+  }, [setOnUrlChange]);
 
   const handleClick = useCallback((e: React.MouseEvent<HTMLImageElement>) => {
     if (sessionState !== 'active') return;
@@ -122,7 +130,10 @@ function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, onStop }: 
     return () => window.removeEventListener('keydown', onKey);
   }, [sessionState, send]);
 
-  const navigate = () => send({ type: 'navigate', url });
+  const navigate = useCallback(() => send({ type: 'navigate', url }), [send, url]);
+  const goBack    = useCallback(() => send({ type: 'back' }),           [send]);
+  const goForward = useCallback(() => send({ type: 'forward' }),        [send]);
+  const reload    = useCallback(() => send({ type: 'reload' }),         [send]);
   const isBooting = sessionState === 'connecting' || sessionState === 'booting' || sessionState === 'reconnecting';
 
   return (
@@ -141,6 +152,47 @@ function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, onStop }: 
       </div>
 
       <div className="urlbar">
+        {/* Navigation cluster: back / forward / reload */}
+        <div className="nav-cluster">
+          <button
+            id="nav-back-btn"
+            className="nav-btn"
+            onClick={goBack}
+            disabled={isBooting || sessionState !== 'active'}
+            title="Back"
+            aria-label="Go back"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="15 18 9 12 15 6" />
+            </svg>
+          </button>
+          <button
+            id="nav-forward-btn"
+            className="nav-btn"
+            onClick={goForward}
+            disabled={isBooting || sessionState !== 'active'}
+            title="Forward"
+            aria-label="Go forward"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+          </button>
+          <button
+            id="nav-reload-btn"
+            className="nav-btn"
+            onClick={reload}
+            disabled={isBooting || sessionState !== 'active'}
+            title="Reload"
+            aria-label="Reload page"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="23 4 23 10 17 10" />
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+            </svg>
+          </button>
+        </div>
+
         <input
           id="url-input"
           className="urlbar-input"
@@ -186,7 +238,7 @@ function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, onStop }: 
 }
 
 export default function Home() {
-  const { sessionState, statusMsg, fps, connect, disconnect, send, setOnFrame } =
+  const { sessionState, statusMsg, fps, connect, disconnect, send, setOnFrame, setOnUrlChange } =
     useRemoteBrowser();
 
   const isStreaming = sessionState !== 'idle';
@@ -202,6 +254,7 @@ export default function Home() {
           fps={fps}
           send={send}
           setOnFrame={setOnFrame}
+          setOnUrlChange={setOnUrlChange}
           onStop={disconnect}
         />
       )}

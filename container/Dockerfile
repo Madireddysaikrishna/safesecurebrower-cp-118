@@ -36,6 +36,12 @@ RUN npm install --omit=dev
 
 COPY browser.js ./
 
+# Run as a non-root user — Chromium with --no-sandbox does not need root.
+# This limits blast radius if the browser process is ever exploited.
+RUN groupadd -r browser && useradd -r -g browser -d /home/browser -m browser
+
+USER browser
+
 EXPOSE 3001
 
 CMD ["node", "browser.js"]

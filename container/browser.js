@@ -11,6 +11,14 @@ const BROWSER_ARGS = [
   '--disable-setuid-sandbox',
   '--disable-gpu',
   '--disable-dev-shm-usage',
+  // Attack surface reduction — disable features not needed for plain browsing
+  '--disable-extensions',
+  '--disable-background-networking',
+  '--disable-sync',
+  '--disable-translate',
+  '--disable-default-apps',
+  '--no-first-run',
+  '--no-pings',
 ];
 
 const wss = new WebSocketServer({ port: WS_PORT, host: '0.0.0.0' });
@@ -39,13 +47,18 @@ wss.on('connection', async (ws) => {
 
     cdpClient = await page.createCDPSession();
 
-    await cdpClient.send('Page.startScreencast', {
-      format: 'jpeg',
-      quality: 75,
-      maxWidth: VIEWPORT.width,
-      maxHeight: VIEWPORT.height,
-      everyNthFrame: 1,
-    });
+    // Extracted so we can restart it after every navigation
+    async function startScreencast() {
+      await cdpClient.send('Page.startScreencast', {
+        format: 'jpeg',
+        quality: 75,
+        maxWidth: VIEWPORT.width,
+        maxHeight: VIEWPORT.height,
+        everyNthFrame: 1,
+      });
+    }
+
+    await startScreencast();
 
     cdpClient.on('Page.screencastFrame', async ({ data, sessionId }) => {
       if (ws.readyState === ws.OPEN) {
@@ -129,8 +142,48 @@ wss.on('connection', async (ws) => {
           }
 
           case 'navigate': {
-            console.log(`[container] Navigating to: ${msg.url}`);
-            await page.goto(msg.url, { waitUntil: 'domcontentloaded' });
+            // Auto-prefix https:// so bare domains like 'google.com' work
+            let targetUrl = msg.url.trim();
+            if (!/^https?:\/\//i.test(targetUrl)) {
+              targetUrl = 'https://' + targetUrl;
+            }
+            console.log(`[container] Navigating to: ${targetUrl}`);
+            try { await cdpClient.send('Page.stopScreencast'); } catch (_) {}
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+            await startScreencast();
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ type: 'url_changed', url: page.url() }));
+            }
+            break;
+          }
+
+          case 'back': {
+            try { await cdpClient.send('Page.stopScreencast'); } catch (_) {}
+            await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
+            await startScreencast();
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ type: 'url_changed', url: page.url() }));
+            }
+            break;
+          }
+
+          case 'forward': {
+            try { await cdpClient.send('Page.stopScreencast'); } catch (_) {}
+            await page.goForward({ waitUntil: 'domcontentloaded' }).catch(() => {});
+            await startScreencast();
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ type: 'url_changed', url: page.url() }));
+            }
+            break;
+          }
+
+          case 'reload': {
+            try { await cdpClient.send('Page.stopScreencast'); } catch (_) {}
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            await startScreencast();
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ type: 'url_changed', url: page.url() }));
+            }
             break;
           }
 
