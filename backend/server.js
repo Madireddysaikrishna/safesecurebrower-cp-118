@@ -23,6 +23,35 @@ const server = http.createServer(app);
 const docker = new Docker({ socketPath: '//./pipe/docker_engine' });
 const wss    = new WebSocketServer({ server });
 
+// ── Dedicated container network ───────────────────────────────────────────
+// Containers run on 'vessel-isolated', a private bridge separate from the
+// host's default bridge. Each container still gets outbound internet via
+// Docker's NAT masquerade (Chromium needs it) but is not on the same L2
+// segment as other host processes.
+const CONTAINER_NETWORK = 'vessel-isolated';
+
+async function ensureIsolatedNetwork() {
+  try {
+    await docker.createNetwork({
+      Name:           CONTAINER_NETWORK,
+      Driver:         'bridge',
+      CheckDuplicate: true,
+      Options:        {
+        // NAT masquerade so containers can reach the internet
+        'com.docker.network.bridge.enable_ip_masquerade': 'true',
+        // Do not expose the bridge interface to other Docker networks
+        'com.docker.network.bridge.enable_icc':           'false',
+      },
+    });
+    console.log(`[backend] Created Docker network: ${CONTAINER_NETWORK}`);
+  } catch (err) {
+    // 409 = already exists — that is fine
+    if (err.statusCode !== 409) throw err;
+    console.log(`[backend] Docker network '${CONTAINER_NETWORK}' already exists.`);
+  }
+}
+
+
 async function waitForContainerPort(port, maxRetries = 30, intervalMs = 500) {
   console.log(`[backend] Probing TCP port ${port} (up to ${maxRetries} attempts)...`);
 
@@ -129,7 +158,7 @@ async function startNewSession(frontendWs) {
       Image: CONTAINER_IMAGE,
       HostConfig: {
         AutoRemove:    true,
-        NetworkMode:   'bridge',
+        NetworkMode:   CONTAINER_NETWORK,
         PortBindings:  { '3001/tcp': [{ HostPort: String(port) }] },
 
         // ── Memory & CPU (existing) ────────────────────────────────────────
@@ -263,10 +292,17 @@ async function cleanup(sessionId, container, containerWs, port) {
   }
 }
 
-server.listen(BACKEND_PORT, () => {
-  console.log(`\n[backend] SafeBrowser backend ready`);
-  console.log(`  HTTP   → http://localhost:${BACKEND_PORT}`);
-  console.log(`  WS     → ws://localhost:${BACKEND_PORT}`);
-  console.log(`  Status → http://localhost:${BACKEND_PORT}/api/status`);
-  console.log(`  Max sessions: ${MAX_SESSIONS} | Orphan TTL: ${TTL_MS / 1000}s\n`);
+// Ensure isolated network exists, then start listening
+ensureIsolatedNetwork().then(() => {
+  server.listen(BACKEND_PORT, () => {
+    console.log(`\n[backend] SafeBrowser backend ready`);
+    console.log(`  HTTP   → http://localhost:${BACKEND_PORT}`);
+    console.log(`  WS     → ws://localhost:${BACKEND_PORT}`);
+    console.log(`  Status → http://localhost:${BACKEND_PORT}/api/status`);
+    console.log(`  Network → ${CONTAINER_NETWORK}`);
+    console.log(`  Max sessions: ${MAX_SESSIONS} | Orphan TTL: ${TTL_MS / 1000}s\n`);
+  });
+}).catch(err => {
+  console.error('[backend] Failed to ensure Docker network:', err.message);
+  process.exit(1);
 });

@@ -8,17 +8,43 @@ const START_URL    = 'https://google.com';
 const NAV_TIMEOUT  = 20000; // 20 s — generous enough for slow sites
 
 const BROWSER_ARGS = [
+  // Required for headless in Docker (no sandbox user-ns available)
   '--no-sandbox',
   '--disable-setuid-sandbox',
+
+  // Rendering / GPU — no display in container
   '--disable-gpu',
   '--disable-dev-shm-usage',
-  '--disable-extensions',
+  '--disable-software-rasterizer',
+
+  // Suppress first-run / telemetry / crash reporter
+  '--no-first-run',
+  '--no-pings',
   '--disable-background-networking',
   '--disable-sync',
   '--disable-translate',
   '--disable-default-apps',
-  '--no-first-run',
-  '--no-pings',
+  '--noerrdialogs',
+  '--disable-breakpad',        // no crash reporter phoning home
+  '--metrics-recording-only',  // metrics stay local, not sent
+
+  // Extensions / plugins — not needed, reduce attack surface
+  '--disable-extensions',
+  '--disable-plugins',
+  '--disable-component-update',
+
+  // Privacy: prevent browsed pages from accessing sensors
+  '--disable-geolocation',
+  '--use-fake-ui-for-media-stream',   // deny webcam/mic silently
+  '--disable-notifications',
+
+  // WebRTC — disable to prevent IP leak through STUN/TURN
+  '--disable-webrtc',
+
+  // Background processes
+  '--disable-background-timer-throttling',
+  '--disable-renderer-backgrounding',
+  '--disable-backgrounding-occluded-windows',
 ];
 
 const wss = new WebSocketServer({ port: WS_PORT, host: '0.0.0.0' });
