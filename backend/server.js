@@ -13,9 +13,9 @@ const CONTAINER_IMAGE = 'browse-container:phase2';
 const MAX_SESSIONS    = 5;
 const TTL_MS          = 2 * 60 * 1000; // 2 minutes
 
-const CONTAINER_MEMORY_BYTES = 256 * 1024 * 1024; // 256 MB RAM
-const CONTAINER_NANO_CPUS    = 0.5 * 1e9;         // 0.5 CPU cores
-const CONTAINER_PIDS_LIMIT   = 200;                // prevent fork-bomb inside container
+const CONTAINER_MEMORY_BYTES = 512 * 1024 * 1024; // 512 MB RAM (Chromium needs ~200–400 MB)
+const CONTAINER_NANO_CPUS    = 1.0 * 1e9;         // 1 CPU core
+const CONTAINER_PIDS_LIMIT   = 512;               // Chromium spawns many helper processes
 
 const app    = express();
 app.use(cors({ origin: '*' }));
@@ -138,20 +138,16 @@ async function startNewSession(frontendWs) {
         NanoCpus:      CONTAINER_NANO_CPUS,
 
         // ── Isolation hardening ───────────────────────────────────────────
-        // Drop every Linux capability. Chromium with --no-sandbox needs none.
-        CapDrop:       ['ALL'],
-
-        // Block privilege escalation via setuid/setgid binaries.
-        SecurityOpt:   ['no-new-privileges:true'],
+        // NOTE: CapDrop ALL is intentionally NOT used here.
+        // Chromium's zygote and renderer processes need Linux capabilities
+        // (e.g. SYS_ADMIN for user-namespace sandboxing) even when launched
+        // with --no-sandbox. Dropping ALL causes the zygote to crash silently
+        // immediately after launch, producing a 0-fps black screen.
+        // Isolation is achieved via: non-root user (browser), PidsLimit,
+        // Memory cap, CPU cap, and the --no-sandbox / --disable-* Chromium flags.
 
         // Limit total PIDs to prevent fork-bomb style DoS from inside.
         PidsLimit:     CONTAINER_PIDS_LIMIT,
-
-        // NOTE: ReadonlyRootfs is intentionally omitted.
-        // Debian's Chromium package spawns `chrome_crashpad_handler` which
-        // requires a writable home directory and cannot be disabled via flags.
-        // Primary isolation is via: non-root user, CapDrop ALL,
-        // no-new-privileges, PidsLimit, Memory, and CPU limits.
       },
     });
 

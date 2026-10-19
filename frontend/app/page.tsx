@@ -78,6 +78,9 @@ interface StreamViewProps {
 function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, setOnUrlChange, onStop }: StreamViewProps) {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [url, setUrl] = useState('https://google.com');
+  // When the container sends url_changed we update the address bar.
+  // This ref prevents that update from triggering an outgoing navigate command.
+  const isRemoteUrlUpdate = useRef(false);
 
   useEffect(() => {
     setOnFrame((base64: string) => {
@@ -90,9 +93,20 @@ function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, setOnUrlCh
   // Keep the URL bar in sync when the remote browser navigates (clicked links, redirects)
   useEffect(() => {
     setOnUrlChange((newUrl: string) => {
+      isRemoteUrlUpdate.current = true;
       setUrl(newUrl);
     });
   }, [setOnUrlChange]);
+
+  // Navigate is ONLY called by user action (Go button / Enter key on url bar).
+  // It must NOT be called automatically when url state changes due to url_changed.
+  const navigate = useCallback(() => {
+    if (isRemoteUrlUpdate.current) {
+      isRemoteUrlUpdate.current = false;
+      return;
+    }
+    send({ type: 'navigate', url });
+  }, [send, url]);
 
   // Compute normalized (0–1) coordinates that account for CSS object-fit:contain
   // letterboxing. The <img> element box may be wider/taller than the actual
@@ -159,7 +173,6 @@ function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, setOnUrlCh
     return () => window.removeEventListener('keydown', onKey);
   }, [sessionState, send]);
 
-  const navigate = useCallback(() => send({ type: 'navigate', url }), [send, url]);
   const goBack    = useCallback(() => send({ type: 'back' }),           [send]);
   const goForward = useCallback(() => send({ type: 'forward' }),        [send]);
   const reload    = useCallback(() => send({ type: 'reload' }),         [send]);
