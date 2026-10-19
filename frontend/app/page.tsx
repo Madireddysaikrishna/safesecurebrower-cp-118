@@ -94,31 +94,60 @@ function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, setOnUrlCh
     });
   }, [setOnUrlChange]);
 
+  // Compute normalized (0–1) coordinates that account for CSS object-fit:contain
+  // letterboxing. The <img> element box may be wider/taller than the actual
+  // rendered image pixels — clicks in the black bars must be clamped so they
+  // don't map outside the Chromium viewport (1280×720).
+  const getImageCoords = useCallback((e: React.MouseEvent<HTMLImageElement>) => {
+    const el   = e.currentTarget;
+    const rect = el.getBoundingClientRect();
+    const elW  = rect.width;
+    const elH  = rect.height;
+
+    // Intrinsic image size (matches VIEWPORT in container: 1280×720).
+    // Falls back to element size before the first frame arrives.
+    const imgW = el.naturalWidth  || elW;
+    const imgH = el.naturalHeight || elH;
+
+    // Scale factor used by object-fit:contain (uniform, letterbox)
+    const scale  = Math.min(elW / imgW, elH / imgH);
+    const rendW  = imgW * scale;
+    const rendH  = imgH * scale;
+    const offX   = (elW - rendW) / 2;   // horizontal black bar width
+    const offY   = (elH - rendH) / 2;   // vertical black bar height
+
+    // Clamp so clicks in the black bars map to the nearest edge pixel
+    const cx = Math.max(0, Math.min(e.clientX - rect.left - offX, rendW));
+    const cy = Math.max(0, Math.min(e.clientY - rect.top  - offY, rendH));
+
+    return { x: cx / rendW, y: cy / rendH };
+  }, []);
+
   const handleClick = useCallback((e: React.MouseEvent<HTMLImageElement>) => {
     if (sessionState !== 'active') return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    send({
-      type: 'click',
-      x: (e.clientX - rect.left) / rect.width,
-      y: (e.clientY - rect.top)  / rect.height,
-    });
-  }, [sessionState, send]);
+    const { x, y } = getImageCoords(e);
+    send({ type: 'click', x, y });
+  }, [sessionState, send, getImageCoords]);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLImageElement>) => {
+    if (sessionState !== 'active') return;
+    const { x, y } = getImageCoords(e);
+    send({ type: 'mousemove', x, y });
+  }, [sessionState, send, getImageCoords]);
 
   const handleWheel = useCallback((e: React.WheelEvent<HTMLImageElement>) => {
     if (sessionState !== 'active') return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    send({
-      type: 'scroll',
-      x: (e.clientX - rect.left) / rect.width,
-      y: (e.clientY - rect.top)  / rect.height,
-      deltaY: e.deltaY,
-    });
-  }, [sessionState, send]);
+    const { x, y } = getImageCoords(e as unknown as React.MouseEvent<HTMLImageElement>);
+    send({ type: 'scroll', x, y, deltaY: e.deltaY });
+  }, [sessionState, send, getImageCoords]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (sessionState !== 'active') return;
-      if ((e.target as HTMLElement).tagName === 'INPUT') return;
+      // Only suppress forwarding when the user is typing in the LOCAL url bar.
+      // Previously this checked tagName === 'INPUT' which also blocked keys
+      // after clicking the stream image if focus drifted to any input element.
+      if ((e.target as HTMLElement).id === 'url-input') return;
       e.preventDefault();
       if (e.key.length === 1) {
         send({ type: 'type', text: e.key });
@@ -221,6 +250,7 @@ function StreamView({ sessionState, statusMsg, fps, send, setOnFrame, setOnUrlCh
           className="stream-img"
           alt="Remote browser stream"
           onClick={handleClick}
+          onMouseMove={handleMouseMove}
           onWheel={handleWheel}
           draggable={false}
           id="stream-img"
