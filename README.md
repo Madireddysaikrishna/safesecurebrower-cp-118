@@ -10,14 +10,27 @@ Multiple users can run independent browser sessions simultaneously. Each session
 
 - Launches a headless Chromium browser inside a Docker container on demand
 - Streams the browser screen to your web UI as a live JPEG feed at roughly 30 fps
-- Forwards mouse clicks, scroll events, and keyboard input to the remote browser
-- Lets you navigate to any URL from a bar in the UI
-- Supports multiple concurrent users, each with their own fully isolated container
+- Forwards mouse clicks, mouse movement, scroll events, and keyboard input to the remote browser
+- Lets you navigate to any URL, go back, go forward, and reload from a toolbar in the UI
+- Supports multiple concurrent users (up to 5 by default), each with their own fully isolated container
 - Survives page refreshes by preserving the session for 2 minutes via TTL-based reconnection
-- Caps each container to 256 MB RAM and 0.5 CPU cores to prevent any single user from crashing the server
+- Caps each container to 512 MB RAM and 1 CPU core to prevent any single user from crashing the host
 - Automatically tears down the container when the session ends or the TTL expires
+- **Authenticates every WebSocket connection** with a shared-secret token before accepting any command
+- **Blocks dangerous URLs** before navigation: rejects bad schemes (`javascript:`, `file:`, `data:`), private/loopback IPv4 and IPv6 destinations, and a configurable hostname denylist; resolves hostnames pre-navigation to catch SSRF via DNS
 
 No external services required. Everything runs on localhost.
+
+---
+
+## What It Does Not Do (Not Implemented)
+
+The following features are **not present** in the current codebase:
+
+- **URL-based phishing/malware detection** — a hostname not on the denylist is not necessarily safe. No ML or reputation service is used.
+- **Data loss prevention (DLP)** — no clipboard isolation, file download interception, or content inspection policy exists.
+- **HTTPS / WSS** — all communication is plain HTTP and plain WebSocket. Do not expose this to any network outside localhost.
+- **Complete DNS-rebinding protection** — the pre-navigation DNS check and CDP redirect intercept reduce SSRF risk but do not prevent a server from returning a private IP *after* the TCP connection is established (true DNS rebinding). Network-level enforcement (e.g. iptables inside the container or a DNS-over-HTTPS proxy) would be required for complete protection.
 
 ---
 
@@ -39,7 +52,7 @@ The system has three distinct layers. Each layer has a single responsibility and
 +------------------+                         +-------------------+                         +----------------------+
 ```
 
-The backend dynamically allocates a host port in the range 30000-40000 for each new container, so multiple containers can run simultaneously without port conflicts.
+The backend dynamically allocates a host port in the range 30000–40000 for each new container, so multiple containers can run simultaneously without port conflicts.
 
 ### Data Flow for a Single Frame
 
@@ -77,22 +90,23 @@ Browser displays the frame
 User clicks on the stream <img> element
         |
         v
-Click handler reads x, y relative to the element dimensions
+Click handler reads x, y relative to the rendered image bounds
+(accounts for object-fit:contain letterboxing)
         |
         v
-Normalizes to 0.0-1.0 range: { type: "click", x: 0.42, y: 0.31 }
+Normalizes to 0.0–1.0 range: { type: "click", x: 0.42, y: 0.31 }
         |
         v
 Frontend sends JSON over WebSocket to backend
         |
         v
-Backend logs the input, looks up the session registry, forwards to the correct container WebSocket
+Backend logs the input and forwards to the correct container WebSocket
         |
         v
-browser.js parses the message, multiplies by viewport size (1280x720)
+browser.js parses the message, multiplies by viewport size (1280×720)
         |
         v
-Sends Input.dispatchMouseEvent via CDP (mousePressed + mouseReleased)
+Sends mouseMoved then mousePressed + mouseReleased via CDP
         |
         v
 Chromium registers the click at those pixel coordinates
@@ -104,14 +118,14 @@ Chromium registers the click at those pixel coordinates
 
 | Layer | Technology | Purpose |
 |---|---|---|
-| Frontend | Next.js 16, React, TypeScript | Web UI, stream rendering, input capture |
+| Frontend | Next.js 16, React 19, TypeScript | Web UI, stream rendering, input capture |
 | Backend | Node.js, Express, ws | HTTP API, WebSocket relay, Docker orchestration |
-| Container | Debian, Node.js, Chromium | Headless browser runtime |
-| Browser Driver | Puppeteer Core | Chromium launch and CDP access |
+| Container | Debian bookworm-slim, Node.js 20, Chromium | Headless browser runtime |
+| Browser Driver | Puppeteer Core ^21 | Chromium launch and CDP access |
 | Browser Protocol | Chrome DevTools Protocol (CDP) | Screen capture, input injection |
-| Container Runtime | Docker (via dockerode) | Spinning up, resource-limiting, and tearing down containers |
-| Communication | WebSockets (ws library) | Real-time bidirectional messaging between all layers |
-| Session Identity | UUID v4 (uuid library) | Persistent session IDs stored in localStorage for reconnection |
+| Container Runtime | Docker (via dockerode ^4) | Spinning up, resource-limiting, and tearing down containers |
+| Communication | WebSockets (ws ^8) | Real-time bidirectional messaging between all layers |
+| Session Identity | UUID v4 (uuid library) | Persistent session IDs stored in `localStorage` for reconnection |
 
 ---
 
@@ -124,14 +138,15 @@ vessel/
 |   |-- Dockerfile           Debian + Chromium + Node.js image definition
 |   |-- browser.js           WebSocket server inside the container, runs Puppeteer and CDP
 |   |-- package.json         puppeteer-core + ws
-|   |-- test-client.html     Minimal HTML to test the container directly
+|   |-- test-client.html     Minimal HTML to test the container directly (Phase 2 smoke test)
 |
 |-- backend/
 |   |-- server.js            Express + WebSocket relay + dockerode orchestrator
 |   |-- portAllocator.js     Finds free host ports in range 30000-40000, prevents race conditions
 |   |-- sessionRegistry.js   In-memory Map of active and orphaned sessions keyed by UUID
+|   |-- isolation-test.js    Docker isolation test harness (runs against live container)
 |   |-- package.json         express + ws + dockerode + cors + uuid
-|   |-- test-client.html     Relay test page
+|   |-- test-client.html     Phase 3 relay smoke-test page
 |
 |-- frontend/
 |   |-- app/
@@ -156,16 +171,26 @@ The container image is a Debian Linux environment with Chromium installed via `a
 When the container starts, `browser.js` runs. It creates a WebSocket server on port 3001 (internally) and waits. The moment the backend connects to it, it:
 
 1. Launches Chromium using `puppeteer.launch()` with flags like `--no-sandbox` and `--disable-dev-shm-usage` required inside Docker
-2. Opens a new page and sets a 1280x720 viewport
+2. Opens a new page and sets a 1280×720 viewport
 3. Navigates to Google
 4. Creates a raw CDP session using `page.createCDPSession()`
-5. Calls `Page.startScreencast` with JPEG format at 75 quality
+5. Calls `Page.startScreencast` with JPEG format at quality 75
 6. Listens for `Page.screencastFrame` events and sends each frame to the WebSocket client
 7. Listens for input commands and maps them to the appropriate CDP calls
 
 When the backend disconnects, the browser is closed. The container itself is then stopped and removed by the backend.
 
-The reason for using `puppeteer-core` instead of `puppeteer` is image size. The full `puppeteer` package downloads its own copy of Chromium on install (around 300 MB). Since we install Chromium through `apt-get` in the Dockerfile, we only need the Node.js library, not the bundled browser.
+The reason for using `puppeteer-core` instead of `puppeteer` is image size. The full `puppeteer` package downloads its own copy of Chromium on install (around 300 MB). Since Chromium is installed through `apt-get` in the Dockerfile, only the Node.js library is needed.
+
+### Container Hardening
+
+Each container runs with these isolation settings (source: `backend/server.js` and `container/browser.js`):
+
+- **Non-root user** — the process runs as the `browser` user (UID > 0), created in the Dockerfile
+- **Private bridge network** — containers are placed on the `vessel-isolated` Docker bridge, which has ICC (`inter-container communication`) disabled
+- **Outbound internet allowed** — NAT masquerade is enabled so Chromium can load web pages
+- **Chromium flags** — WebRTC disabled (`--disable-webrtc`), geolocation disabled, webcam/mic silently denied, extensions and plugins disabled, crash reporter disabled
+- **`CapDrop ALL` is intentionally not used** — dropping all Linux capabilities causes the Chromium zygote process to crash silently on startup. Isolation is achieved through non-root user, resource limits, and the network mode instead.
 
 ---
 
@@ -175,7 +200,7 @@ The backend (`server.js`) has three responsibilities: HTTP API, Docker orchestra
 
 ### Multi-Tenant Session Management
 
-The backend can handle up to 5 concurrent sessions (configurable via `MAX_SESSIONS`). Each connection goes through this flow:
+The backend handles up to 5 concurrent sessions (configurable via `MAX_SESSIONS` in `server.js`). Each connection goes through this flow:
 
 1. The frontend connects and sends a `hello` message containing either a stored session UUID (reconnection attempt) or `null` (new session)
 2. If reconnecting with a valid UUID, the backend resumes that session immediately without touching Docker
@@ -187,13 +212,11 @@ The `sessionRegistry` is an in-memory `Map` keyed by UUID. Each entry stores the
 
 ### TCP Readiness Probe
 
-After starting a container, the backend probes the allocated host port using a raw TCP socket (`net.createConnection`) until it opens. A WebSocket probe is deliberately not used here because it would complete the HTTP upgrade handshake, triggering the container's `wss.on('connection')` event and launching Chromium before the real user connects.
+After starting a container, the backend probes the allocated host port using a raw TCP socket (`net.createConnection`) until it opens. This avoids triggering a WebSocket upgrade handshake during the probe, which would launch Chromium prematurely.
 
 ### WebSocket Relay
 
 The backend acts as a transparent relay. Container frames are forwarded to the connected frontend socket. Frontend inputs are logged and forwarded to the container socket. Each session has its own pair of sockets and they never cross.
-
-When a frontend disconnects, the backend does not immediately stop the container.
 
 ### TTL-Based Graceful Reconnection
 
@@ -208,25 +231,28 @@ This means a page refresh never destroys the remote browser session.
 
 ### Resource Limits (Noisy Neighbor Protection)
 
-Every container is created with hard resource limits injected into the Docker `HostConfig` via the cgroups interface:
+Every container is created with hard resource limits injected into the Docker `HostConfig` via the cgroups interface. Values are defined at the top of `backend/server.js`:
 
-- `Memory: 256 MB` — if any process in the container exceeds 256 MB RAM, the Linux OOM Killer fires immediately inside that container only
-- `MemorySwap: 256 MB` — equal to `Memory`, which disables swap entirely for this container, preventing silent disk thrashing
-- `NanoCpus: 0.5 CPU cores` — enforced by the Linux CFS scheduler, preventing any single container from monopolising the host CPU
+| Constant | Value | Effect |
+|---|---|---|
+| `CONTAINER_MEMORY_BYTES` | **512 MB** | OOM killer fires inside the container if exceeded |
+| `MemorySwap` | equal to Memory | Disables swap entirely for that container |
+| `CONTAINER_NANO_CPUS` | **1.0 core** | Enforced by Linux CFS scheduler |
+| `CONTAINER_PIDS_LIMIT` | **512** | Prevents fork-bomb style DoS from inside the container |
 
-These limits are enforced at the Linux kernel level. Other containers and the Node.js backend process are in separate cgroups and are completely unaffected if one container's processes are OOM-killed.
+These limits are enforced at the Linux kernel level. Other containers and the Node.js backend process are in separate cgroups and are completely unaffected if one container hits a limit.
 
 ---
 
 ## How the Frontend Works
 
-The frontend is a Next.js app with two visual states: a landing page and a stream view.
+The frontend is a Next.js 16 app with two visual states: a landing page and a stream view.
 
-All WebSocket logic lives in `useRemoteBrowser.ts`, a custom React hook. The hook manages connection state, status messages, frame callbacks, and reconnection identity.
+All WebSocket logic lives in `hooks/useRemoteBrowser.ts`, a custom React hook. The hook manages connection state, status messages, frame callbacks, and reconnection identity.
 
 ### Session Persistence
 
-On startup, the hook checks `localStorage` for a `vessel_session_id` key. If one exists, it sends it in the `hello` message. If the backend confirms the session is still alive (`session_resumed`), the stream picks up immediately. If the backend reports the session expired, `localStorage` is cleared and a fresh container is booted.
+On startup, the hook checks `localStorage` for a `safebrowser_session_id` key (source: `useRemoteBrowser.ts` line 22). If one exists, it sends it in the `hello` message. If the backend confirms the session is still alive (`session_resumed`), the stream picks up immediately. If the backend reports the session expired, `localStorage` is cleared and a fresh container is booted.
 
 The `disconnect` function explicitly removes the UUID from `localStorage`, ensuring a deliberate end session does not reconnect to the old container.
 
@@ -236,9 +262,9 @@ Incoming JPEG frames arrive at roughly 30 per second. Instead of calling `setSta
 
 ### Input Handling
 
-Keyboard input is captured by a `window.addEventListener('keydown')` listener. Single printable characters are sent as `{ type: "type" }` commands, which map to the `Input.insertText` CDP command on the container side. Special keys like Enter, Backspace, Tab, and arrow keys are sent as `{ type: "keydown" }` and mapped to `Input.dispatchKeyEvent`.
+Keyboard input is captured by a `window.addEventListener('keydown')` listener. The listener is suppressed only when the focused element is the local URL input (`id="url-input"`). Single printable characters are sent as `{ type: "type" }` commands, which map to the `Input.insertText` CDP command. Special keys (Enter, Backspace, Tab, arrow keys) are sent as `{ type: "keydown" }` and mapped to `Input.dispatchKeyEvent`.
 
-Mouse coordinates are normalized to a 0.0-1.0 range before being sent. The container multiplies them back to pixel coordinates using the viewport dimensions (1280x720). This means the frontend does not need to know the container's resolution.
+Mouse coordinates are normalized to a 0.0–1.0 range before being sent, with a correction for `object-fit: contain` letterboxing so clicks in the black bars are clamped to the image edge rather than mapping outside the Chromium viewport.
 
 ---
 
@@ -246,7 +272,7 @@ Mouse coordinates are normalized to a 0.0-1.0 range before being sent. The conta
 
 ### Prerequisites
 
-- Docker installed and running
+- Docker Desktop installed and running (the backend connects via the Windows named pipe `//./pipe/docker_engine`)
 - Node.js 18 or higher
 - npm
 
@@ -257,9 +283,35 @@ cd container
 docker build -t browse-container:phase2 .
 ```
 
-This step takes 2-3 minutes on the first run because it downloads Chromium and Node.js. Subsequent builds use Docker layer cache and are much faster.
+This step takes 2–3 minutes on the first run because it downloads Chromium and Node.js. Subsequent builds use the Docker layer cache and are much faster.
 
-### Step 2: Start the Backend
+### Step 2: Configure Authentication
+
+The backend refuses to start without a shared secret, and every WebSocket client must present that secret in its `hello` message.
+
+**Generate a strong token:**
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+**Create `backend/.env`** (already in `.gitignore` — never commit this file):
+
+```
+VESSEL_TOKEN=<paste-your-generated-token-here>
+```
+
+**Create `frontend/.env.local`** (already in `.gitignore`):
+
+```
+VESSEL_TOKEN=<same-token-as-above>
+```
+
+The frontend reads `VESSEL_TOKEN` through a server-side Next.js API route (`/api/token`). It is **not** prefixed with `NEXT_PUBLIC_` and is therefore never compiled into the browser JavaScript bundle. See `frontend/app/api/token/route.ts`.
+
+> **Optional:** Override the allowed HTTP origin (default `http://localhost:3002`) by adding `ALLOWED_ORIGIN=http://your-host:3002` to `backend/.env`.
+
+### Step 3: Start the Backend
 
 ```bash
 cd backend
@@ -270,14 +322,17 @@ node server.js
 You should see:
 
 ```
-[backend] Vessel backend ready
+[backend] SafeBrowser backend ready
   HTTP   -> http://localhost:3000
   WS     -> ws://localhost:3000
   Status -> http://localhost:3000/api/status
+  Network -> vessel-isolated
   Max sessions: 5 | Orphan TTL: 120s
 ```
 
-### Step 3: Start the Frontend
+If `VESSEL_TOKEN` is missing the process exits immediately with a clear message.
+
+### Step 4: Start the Frontend
 
 Open a second terminal:
 
@@ -293,20 +348,32 @@ You should see Next.js start on port 3002:
 Local: http://localhost:3002
 ```
 
-### Step 4: Open the UI
+### Step 5: Open the UI
 
-Visit `http://localhost:3002` in your browser. Click "Start Browser". The backend will:
+Visit `http://localhost:3002` in your browser. Click **Start Browser**. The backend will:
 
-1. Allocate a free host port in the range 30000-40000
-2. Spin up the Docker container mapped to that port (takes about 5-10 seconds on first run)
-3. Launch Chromium inside it with 256 MB RAM and 0.5 CPU limits applied
-4. Start streaming frames to your browser
+1. Ensure the `vessel-isolated` Docker bridge network exists
+2. Allocate a free host port in the range 30000–40000
+3. Spin up the Docker container mapped to that port (takes about 5–10 seconds)
+4. Launch Chromium inside it, capped at 512 MB RAM and 1 CPU core
+5. Start streaming frames to your browser
 
-You will see Google load in the stream. Click anywhere on the stream to interact with it. Type to enter text. Use the URL bar at the top to navigate.
+You will see Google load in the stream. Click anywhere on the stream to interact with it. Type to enter text. Use the URL toolbar to navigate, go back, go forward, or reload.
 
-Click "End Session" to stop the container. Docker removes it automatically.
+Click **End Session** to stop the container. Docker removes it automatically.
 
-If you accidentally refresh the page, the session will resume automatically within 2 minutes using the UUID stored in your browser's `localStorage`.
+If you accidentally refresh the page, the session will resume automatically within 2 minutes using the UUID stored in your browser's `localStorage` under the key `safebrowser_session_id`.
+
+### Optional: Change the Backend URL
+
+The frontend reads `NEXT_PUBLIC_BACKEND_URL` from the environment. To point at a different backend host, add it to `frontend/.env.local`:
+
+```
+NEXT_PUBLIC_BACKEND_URL=ws://your-host:3000
+```
+
+If the variable is not set, the frontend defaults to `ws://localhost:3000`.
+
 
 ---
 
@@ -315,8 +382,8 @@ If you accidentally refresh the page, the session will resume automatically with
 | Port | Service | Notes |
 |---|---|---|
 | 3000 | Backend HTTP + WebSocket | REST API and relay server |
-| 3002 | Frontend (Next.js dev) | The UI you interact with |
-| 30000-40000 | Container WebSockets | Dynamically allocated per session, mapped from internal port 3001 |
+| 3002 | Frontend (Next.js dev) | The UI you interact with (`npm run dev`) |
+| 30000–40000 | Container WebSockets | Dynamically allocated per session, mapped from internal port 3001 |
 
 ---
 
@@ -326,13 +393,18 @@ The container's `browser.js` accepts the following JSON commands over its WebSoc
 
 | Command | Fields | Action |
 |---|---|---|
-| `hello` | sessionId (string or null) | Handshake sent on connection, identifies reconnecting sessions |
-| `click` | x, y (normalized 0-1) | Left mouse click at that position |
-| `scroll` | x, y, deltaY | Mouse wheel scroll |
-| `type` | text | Insert printable character via CDP insertText |
-| `keydown` | key | Special key press (Enter, Backspace, etc.) |
-| `navigate` | url | Navigate the page to a new URL |
-| `mousemove` | x, y | Move the mouse cursor |
+| `hello` | `sessionId` (string or null), `token` (string) | Handshake; `token` is validated server-side before any session work proceeds |
+| `navigate` | `url` | Navigate to a URL; `https://` is prepended if no scheme is present |
+| `click` | `x`, `y` (normalized 0–1) | Left mouse click at that position |
+| `mousemove` | `x`, `y` (normalized 0–1) | Move the mouse cursor without clicking |
+| `scroll` | `x`, `y`, `deltaY` | Mouse wheel scroll |
+| `type` | `text` | Insert a printable character via CDP `insertText` |
+| `keydown` | `key` | Special key press (Enter, Backspace, Tab, arrow keys, etc.) |
+| `back` | _(none)_ | Navigate back in browser history |
+| `forward` | _(none)_ | Navigate forward in browser history |
+| `reload` | _(none)_ | Reload the current page |
+
+All `navigate`, `back`, `forward`, and `reload` commands are protected by a `navigating` boolean mutex in `browser.js` to prevent concurrent `page.goto()` calls from stacking up and causing navigation loops.
 
 ---
 
@@ -361,27 +433,108 @@ Session resumes, TTL cancelled               | Cleanup runs, container stopped
 
 ---
 
-## Known Limitations and Gotchas
+## Running the Isolation Test
 
-**Container startup time.** Chromium takes 5-10 seconds to launch inside the container. This is normal. The booting overlay in the UI covers the stream area during this time.
-
-**Port conflicts.** If containers are not cleaned up properly (for example if the backend crashes), ports in the 30000-40000 range may remain allocated. Clean up all Vessel containers with:
+The backend includes a standalone test script that starts a container and verifies isolation properties:
 
 ```bash
-docker ps -a --filter ancestor=browse-container:phase2 --format "{{.ID}}" | xargs -r docker rm -f
+cd backend
+node isolation-test.js
 ```
 
-**Frame quality vs performance.** The screencast is configured at JPEG quality 75. You can raise this in `container/browser.js` under `Page.startScreencast` options, but it increases bandwidth between the container and the backend.
+The test checks:
 
-**No HTTPS.** All communication is plain HTTP and WS. This is fine for local use, but you would need TLS and proper authentication before exposing this to any network.
+- **A. Lifecycle** — container is running, not privileged
+- **B. User identity** — process runs as `browser` (non-root), UID > 0, effective capabilities = 0x0
+- **C. Resource limits** — Memory, MemorySwap, NanoCpus, PidsLimit match expected values
+- **D. Network** — `NetworkMode` is `vessel-isolated`, outbound internet is reachable
+- **E. Filesystem** — `/app` is not writable by the `browser` user
+- **F. Browser location** — Chromium is not running on the host; `node browser.js` is running inside the container
 
-**Memory limit and Chromium.** The 256 MB RAM limit is intentionally conservative. Very heavy pages with many media elements may hit this limit and cause tab crashes inside the remote browser. You can raise `CONTAINER_MEMORY_BYTES` in `backend/server.js` if needed.
+Requires Docker to be running and the `browse-container:phase2` image to be built first.
+
+---
+
+## URL Threat Detection
+
+Every user-initiated navigation is evaluated by `checkUrl()` in `container/browser.js` **before** `page.goto()` is called.
+
+### What is checked
+
+| Check | Detail |
+|---|---|
+| URL parseable | Rejects anything that cannot be parsed as a valid URL |
+| Scheme whitelist | Only `http:` and `https:` are accepted. `javascript:`, `file:`, `data:`, `ftp:`, `blob:`, `vbscript:` etc. are blocked |
+| IPv6 literals | All IPv6 literals in URLs are blocked (e.g. `http://[::1]`, `http://[2001:db8::]`) |
+| Private IPv4 literals | `127.x`, `10.x`, `172.16–31.x`, `192.168.x`, `169.254.x`, `0.0.0.0`, `192.0.2.x` etc. are blocked |
+| Denylist | Configurable list of exact hostnames and their subdomains (see `DENYLIST` in `container/browser.js`) |
+| Pre-navigation DNS resolution | The hostname is resolved via `dns.lookup()` before navigation. If any resolved IP is private/loopback, the navigation is blocked |
+| Redirect interception | A CDP `Network.requestWillBeSent` listener catches HTTP redirects mid-navigation and calls `Page.stopLoading` if the redirect destination is blocked |
+
+### What a blocked navigation does
+
+The container sends a `{ type: 'nav_blocked', reason: '...' }` message back to the frontend. The UI displays the reason as a 5-second warning banner without terminating the session. The stream continues from the last successfully loaded page.
+
+### Known limitations
+
+- **Not a phishing detector** — a URL absent from the denylist is not necessarily safe.
+- **DNS-rebinding gap** — `checkUrl()` resolves the hostname once, before navigation starts. A malicious server that serves a legitimate IP on the first query and then switches to a private IP on subsequent queries (classic DNS rebinding) is not fully stopped by this check alone.
+- **Public IPv6 allowed** — public AAAA records (e.g. for `example.com`) are permitted through the DNS path. Only loopback, link-local, unique-local, and IPv4-mapped private ranges are blocked.
+
+### Extending the denylist
+
+Edit the `DENYLIST` array at the top of `container/browser.js`:
+
+```javascript
+const DENYLIST = [
+  'malware-test.example',
+  'phishing-test.example',
+  'denylist-test.invalid',
+  // add your entries here — exact hostname or subdomain match
+];
+```
+
+After editing, rebuild the container image:
+
+```bash
+cd container
+docker build -t browse-container:phase2 .
+```
+
+### Running the URL threat test
+
+```bash
+cd container
+node url-threat-test.js
+```
+
+This is a pure unit test — it does not require Docker or a running container. It covers 40 checks across 10 categories (A–J).
+
+---
+
+**Container startup time.** Chromium takes 5–10 seconds to launch inside the container. This is normal. The booting overlay in the UI covers the stream area during this time.
+
+**Port conflicts.** If containers are not cleaned up properly (for example if the backend crashes), ports in the 30000–40000 range may remain allocated. Clean up all Vessel containers with:
+
+```bash
+docker ps -a --filter ancestor=browse-container:phase2 --format "{{.ID}}" | xargs docker rm -f
+```
+
+**Frame quality vs. performance.** The screencast is configured at JPEG quality 75. Raising this in `container/browser.js` under `Page.startScreencast` increases bandwidth between the container and the backend.
+
+**Memory and heavy pages.** The 512 MB RAM limit is sufficient for most pages. Very heavy pages with many media elements may hit this limit and cause a tab crash inside the remote browser. You can raise `CONTAINER_MEMORY_BYTES` in `backend/server.js` if needed.
+
+**No HTTPS or WSS.** All communication is plain HTTP and WebSocket. This is intentional for local development only. Do not expose this backend on any network without adding TLS and authentication.
+
+**No authentication.** There is no mechanism to restrict who can connect to the backend and start a container. This is an accepted limitation for local use.
+
+**Session IDs are not access-controlled.** The UUID stored in `localStorage` under `safebrowser_session_id` acts as a bearer token. Any code with access to that value can resume the corresponding session.
+
+**No end-to-end automated tests.** The isolation test verifies container security properties. There are no automated tests for the WebSocket relay path, multi-session concurrency, or the frontend UI. All interaction testing is currently manual.
 
 ---
 
 ## How It Was Built (Phase by Phase)
-
-The project was built incrementally.
 
 **Phase 1** established that Chromium could run headlessly inside Docker at all. The output was a single screenshot saved to `/tmp/screenshot.png`.
 
@@ -395,4 +548,6 @@ The project was built incrementally.
 
 **Phase 6** added graceful reconnection with TTL-based session preservation. Page refreshes no longer destroy the remote browser. Sessions are kept alive for 2 minutes in an `orphaned` state before being garbage collected.
 
-**Phase 7** added Linux cgroup-based resource limits. Each container is capped at 256 MB RAM and 0.5 CPU cores, enforced at the kernel level, to prevent any single user from crashing the host machine.
+**Phase 7** added Linux cgroup-based resource limits. Each container is capped at **512 MB RAM** and **1 CPU core**, with swap disabled and PID count limited to 512.
+
+**Phase 8** added the `vessel-isolated` Docker bridge network with ICC disabled, hardened Chromium launch flags (WebRTC off, geolocation off, webcam/mic denied), and the standalone isolation test harness. Several bugs were also fixed: the navigate-loop caused by `url_changed` feedback, the 0-fps screencast freeze after navigation, click coordinate mapping for letterboxed images, mouse pre-move for accurate CDP hit testing, and the CapDrop ALL black-screen issue.

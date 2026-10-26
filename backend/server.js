@@ -1,5 +1,7 @@
 const http     = require('http');
 const net      = require('net');
+const crypto   = require('crypto');
+const fs       = require('fs');
 const express  = require('express');
 const cors     = require('cors');
 const { WebSocketServer, WebSocket } = require('ws');
@@ -17,11 +19,53 @@ const CONTAINER_MEMORY_BYTES = 512 * 1024 * 1024; // 512 MB RAM (Chromium needs 
 const CONTAINER_NANO_CPUS    = 1.0 * 1e9;         // 1 CPU core
 const CONTAINER_PIDS_LIMIT   = 512;               // Chromium spawns many helper processes
 
+// ── Load backend/.env if present (no extra package needed) ──────────────────
+try {
+  const lines = fs.readFileSync('.env', 'utf8').split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq < 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const val = trimmed.slice(eq + 1).trim();
+    if (!(key in process.env)) process.env[key] = val;
+  }
+} catch (_) { /* .env is optional — use shell export or inline env instead */ }
+
+// ── Authentication ───────────────────────────────────────────────────────────
+// VESSEL_TOKEN is the shared secret all legitimate clients must present in
+// their hello message. Set it in backend/.env or export it before starting.
+const VESSEL_TOKEN = process.env.VESSEL_TOKEN;
+if (!VESSEL_TOKEN) {
+  console.error('[backend] FATAL: VESSEL_TOKEN is not set.');
+  console.error('[backend] Create backend/.env with: VESSEL_TOKEN=<your-secret>');
+  console.error('[backend] Or inline:  VESSEL_TOKEN=<secret> node server.js');
+  process.exit(1);
+}
+
+// ALLOWED_ORIGIN: the only HTTP origin permitted to reach the REST API and
+// upgrade to WebSocket. Default matches the Next.js dev server (port 3002).
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3002';
+
 const app    = express();
-app.use(cors({ origin: '*' }));
+app.use(cors({ origin: ALLOWED_ORIGIN, optionsSuccessStatus: 200 }));
 const server = http.createServer(app);
 const docker = new Docker({ socketPath: '//./pipe/docker_engine' });
-const wss    = new WebSocketServer({ server });
+
+// Reject WS upgrade requests from disallowed origins. Browsers always send
+// the Origin header; non-browser clients (test scripts) that omit it are
+// allowed through so the auth-test harness can run without a browser.
+const wss = new WebSocketServer({
+  server,
+  verifyClient: ({ req }) => {
+    const origin = req.headers.origin;
+    if (!origin) return true;                  // non-browser client
+    if (origin === ALLOWED_ORIGIN) return true;
+    console.warn(`[backend] WS upgrade rejected: origin='${origin}'`);
+    return false;
+  },
+});
 
 // ── Dedicated container network ───────────────────────────────────────────
 // Containers run on 'vessel-isolated', a private bridge separate from the
@@ -90,15 +134,22 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+// ── Token authentication helper ──────────────────────────────────────────────
+// crypto.timingSafeEqual prevents timing-based token probing.
+function validateToken(provided) {
+  if (!provided || typeof provided !== 'string') return false;
+  try {
+    const a = Buffer.from(VESSEL_TOKEN);
+    const b = Buffer.from(provided);
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch (_) {
+    return false;
+  }
+}
+
 wss.on('connection', (frontendWs) => {
   console.log(`\n[backend] New WS connection. Active sessions: ${registry.getSessionCount()}/${MAX_SESSIONS}`);
-
-  if (registry.getSessionCount() >= MAX_SESSIONS) {
-    console.warn('[backend] At capacity. Rejecting.');
-    frontendWs.send(JSON.stringify({ type: 'error', message: 'Server is at capacity. Please try again later.' }));
-    frontendWs.close();
-    return;
-  }
 
   frontendWs.once('message', async (raw) => {
     let msg;
@@ -110,6 +161,22 @@ wss.on('connection', (frontendWs) => {
     }
 
     if (msg.type !== 'hello') {
+      frontendWs.close();
+      return;
+    }
+
+    // ── Authenticate first — before revealing session or capacity info ────────
+    if (!validateToken(msg.token)) {
+      console.warn('[backend] Rejected unauthenticated connection (bad or missing token).');
+      frontendWs.send(JSON.stringify({ type: 'error', message: 'Unauthorized: invalid or missing token.' }));
+      frontendWs.close();
+      return;
+    }
+
+    // ── Capacity check (post-auth to avoid leaking server state) ─────────────
+    if (registry.getSessionCount() >= MAX_SESSIONS) {
+      console.warn('[backend] At capacity. Rejecting.');
+      frontendWs.send(JSON.stringify({ type: 'error', message: 'Server is at capacity. Please try again later.' }));
       frontendWs.close();
       return;
     }

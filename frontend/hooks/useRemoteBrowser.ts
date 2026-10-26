@@ -11,7 +11,7 @@ export interface RemoteBrowserState {
 }
 
 export interface RemoteBrowserActions {
-  connect:    () => void;
+  connect:    () => Promise<void>;
   disconnect: () => void;
   send:       (msg: object) => void;
   setOnFrame: (cb: (data: string) => void) => void;
@@ -39,7 +39,7 @@ export function useRemoteBrowser(): RemoteBrowserState & RemoteBrowserActions {
     return () => clearInterval(timer);
   }, []);
 
-  const connect = useCallback(() => {
+  const connect = useCallback(async () => {
     // Guard: already connecting or active
     if (wsRef.current) return;
     if (sessionState !== 'idle' && sessionState !== 'error') return;
@@ -50,6 +50,29 @@ export function useRemoteBrowser(): RemoteBrowserState & RemoteBrowserActions {
     setSessionState(isReconnect ? 'reconnecting' : 'connecting');
     setStatusMsg(isReconnect ? 'Resuming your session...' : 'Connecting to backend...');
 
+    // ── Fetch auth token from the Next.js server-side API route ─────────────
+    // VESSEL_TOKEN lives in the server environment and is served at runtime by
+    // /api/token. It is never embedded in the compiled JavaScript bundle.
+    let token: string;
+    try {
+      const res = await fetch('/api/token');
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({})) as { error?: string };
+        throw new Error(body.error ?? `HTTP ${res.status}`);
+      }
+      const data = await res.json() as { token?: string };
+      if (!data.token) throw new Error('token field missing in response');
+      token = data.token;
+    } catch (err: unknown) {
+      setSessionState('error');
+      setStatusMsg(
+        'Auth error: ' +
+        (err instanceof Error ? err.message : String(err)) +
+        '. Ensure VESSEL_TOKEN is set in frontend/.env.local'
+      );
+      return;
+    }
+
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
 
@@ -57,6 +80,7 @@ export function useRemoteBrowser(): RemoteBrowserState & RemoteBrowserActions {
       ws.send(JSON.stringify({
         type:      'hello',
         sessionId: storedSessionId ?? null,
+        token,             // verified server-side; never exposed in the bundle
       }));
       if (!isReconnect) {
         setSessionState('booting');
@@ -102,6 +126,13 @@ export function useRemoteBrowser(): RemoteBrowserState & RemoteBrowserActions {
         case 'error':
           setSessionState('error');
           setStatusMsg(msg.message as string);
+          break;
+
+        case 'nav_blocked':
+          // URL was blocked by the container's threat detection.
+          // Show a transient warning — the session stays active.
+          setStatusMsg(`Blocked: ${msg.reason as string}`);
+          setTimeout(() => setStatusMsg(''), 5000);
           break;
       }
     };
