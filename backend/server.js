@@ -44,6 +44,14 @@ if (!VESSEL_TOKEN) {
   process.exit(1);
 }
 
+// ── Safe Browsing configuration ───────────────────────────────────────────────
+// Read from the backend environment and forwarded into each container instance
+// so checkUrl() inside the container can call the Safe Browsing API.
+// The API key is NEVER sent to the frontend or embedded in any client bundle.
+const SAFE_BROWSING_API_KEY    = process.env.SAFE_BROWSING_API_KEY    || '';
+const SAFE_BROWSING_FAIL_OPEN  = process.env.SAFE_BROWSING_FAIL_OPEN  || 'false';
+const SAFE_BROWSING_TIMEOUT_MS = process.env.SAFE_BROWSING_TIMEOUT_MS || '3000';
+
 // ALLOWED_ORIGIN: the only HTTP origin permitted to reach the REST API and
 // upgrade to WebSocket. Default matches the Next.js dev server (port 3002).
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3002';
@@ -221,8 +229,24 @@ async function startNewSession(frontendWs) {
     port = await allocatePort();
     console.log(`[backend] Allocated port: ${port}`);
 
+    // Build the environment variable list to inject into the container.
+    // Safe Browsing config is forwarded here so checkUrl.js inside the
+    // container can call the Google Safe Browsing API without the key
+    // ever reaching the frontend or being embedded in the client bundle.
+    const containerEnv = [
+      `SAFE_BROWSING_FAIL_OPEN=${SAFE_BROWSING_FAIL_OPEN}`,
+      `SAFE_BROWSING_TIMEOUT_MS=${SAFE_BROWSING_TIMEOUT_MS}`,
+    ];
+    // Only forward the key if it is actually configured — an empty string
+    // tells checkUrl.js to skip Safe Browsing entirely, which is the same
+    // as not setting it at all, but being explicit avoids confusion.
+    if (SAFE_BROWSING_API_KEY) {
+      containerEnv.push(`SAFE_BROWSING_API_KEY=${SAFE_BROWSING_API_KEY}`);
+    }
+
     container = await docker.createContainer({
       Image: CONTAINER_IMAGE,
+      Env:   containerEnv,
       HostConfig: {
         AutoRemove:    true,
         NetworkMode:   CONTAINER_NETWORK,
@@ -362,11 +386,15 @@ async function cleanup(sessionId, container, containerWs, port) {
 // Ensure isolated network exists, then start listening
 ensureIsolatedNetwork().then(() => {
   server.listen(BACKEND_PORT, () => {
+    const sbStatus = SAFE_BROWSING_API_KEY
+      ? `enabled (fail-${SAFE_BROWSING_FAIL_OPEN === 'true' ? 'open' : 'closed'}, timeout ${SAFE_BROWSING_TIMEOUT_MS} ms)`
+      : 'disabled (no SAFE_BROWSING_API_KEY set)';
     console.log(`\n[backend] SafeBrowser backend ready`);
-    console.log(`  HTTP   → http://localhost:${BACKEND_PORT}`);
-    console.log(`  WS     → ws://localhost:${BACKEND_PORT}`);
-    console.log(`  Status → http://localhost:${BACKEND_PORT}/api/status`);
-    console.log(`  Network → ${CONTAINER_NETWORK}`);
+    console.log(`  HTTP          → http://localhost:${BACKEND_PORT}`);
+    console.log(`  WS            → ws://localhost:${BACKEND_PORT}`);
+    console.log(`  Status        → http://localhost:${BACKEND_PORT}/api/status`);
+    console.log(`  Network       → ${CONTAINER_NETWORK}`);
+    console.log(`  Safe Browsing → ${sbStatus}`);
     console.log(`  Max sessions: ${MAX_SESSIONS} | Orphan TTL: ${TTL_MS / 1000}s\n`);
   });
 }).catch(err => {
